@@ -1,174 +1,151 @@
+import os
+import json
+import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
-from fpdf import FPDF
-from io import BytesIO
-import json
-import os
 
-# --- Словарь для хранения данных: {артикул: {цвет: количество_пар}} ---
-inventory = {}
+# Настройка логов
+logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
 
-# --- Сессия текущего артикула ---
-current_article = None
+# Путь для сохранения данных (совместимо с Railway Volume)
+DATA_DIR = "/app/data" if os.path.exists("/app/data") else "."
+DATA_FILE = os.path.join(DATA_DIR, "inventory.json")
 
-# --- Загрузка стартового инвентаря из JSON ---
-try:
-    with open("initial_inventory.json", "r", encoding="utf-8") as f:
-        initial_data = json.load(f)
-        for art, colors in initial_data.items():
-            inventory[art] = {color: 0 for color in colors}
-except FileNotFoundError:
-    pass  # если файла нет, работаем пустым inventory
+def load_data():
+    if os.path.exists(DATA_FILE):
+        try:
+            with open(DATA_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except: return {}
+    return {}
 
-# --- Главное меню ---
-async def main_menu(update):
+def save_data():
+    if not os.path.exists(DATA_DIR) and DATA_DIR != ".":
+        os.makedirs(DATA_DIR)
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(inventory, f, ensure_ascii=False, indent=4)
+
+inventory = load_data()
+current_article = {}
+
+async def main_menu(update: Update):
     keyboard = [
-        [InlineKeyboardButton("Рестарт всего", callback_data="restart_confirm")],
-        [InlineKeyboardButton("Итог / PDF", callback_data="pdf")]
+        [InlineKeyboardButton("🔄 Обнулить склад", callback_data="restart_confirm")],
+        [InlineKeyboardButton("📋 Получить сводку", callback_data="report")],
+        [InlineKeyboardButton("▶️ Начать работу", callback_data="start_bot")]
     ]
-    await update.message.reply_text(
-        "Введите артикул или выберите команду ниже:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    text = "📦 **Система учета склада**\nВведите номер артикула или выберите действие:"
+    if update.message:
+        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    else:
+        await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
-# --- Старт бота ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await main_menu(update)
 
-# --- Обработка сообщений (артикул или новый цвет) ---
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global current_article
+    user_id = update.effective_user.id
     text = update.message.text.strip()
-    
-    if text.isdigit():  # новый артикул
-        current_article = text
-        if current_article not in inventory:
-            inventory[current_article] = {}  # пока без цветов, можно добавить потом
-        await show_colors(update)
-    else:  # новый цвет для текущего артикула
-        if current_article:
-            color = text
-            if color not in inventory[current_article]:
-                inventory[current_article][color] = 0
-            await show_colors(update)
 
-# --- Показ цветов с кнопками +6 ---
-async def show_colors(update_or_query):
-    global current_article
-    article = inventory[current_article]
-    keyboard = []
-    for color in article:
-        keyboard.append([InlineKeyboardButton(f"{color} [+6] ({article[color]} пар)", callback_data=f"add6|{color}")])
-    keyboard.append([InlineKeyboardButton("➕ Добавить цвет", callback_data="add_color")])
-    keyboard.append([InlineKeyboardButton("🔄 Сброс артикула", callback_data="reset_article_confirm")])
-    keyboard.append([InlineKeyboardButton("⬅ Назад к меню", callback_data="back")])
-    keyboard.append([InlineKeyboardButton("🔄 Рестарт всего", callback_data="restart_confirm")])
-    keyboard.append([InlineKeyboardButton("➡ Итог / PDF", callback_data="pdf")])
-
-    text = f"Артикул: {current_article}"
-    if hasattr(update_or_query, "message"):
-        await update_or_query.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    # Если ввели цифры - это артикул
+    if any(char.isdigit() for char in text):
+        current_article[user_id] = text
+        if text not in inventory:
+            inventory[text] = {}
+        await show_colors(update, context)
     else:
-        await update_or_query.edit_message_text(text=text, reply_markup=InlineKeyboardMarkup(keyboard))
-
-# --- Обработка нажатий кнопок ---
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global current_article
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-
-    # --- +6 пар ---
-    if data.startswith("add6"):
-        _, color = data.split("|")
-        inventory[current_article][color] += 6
-        await show_colors(query)
-
-    # --- Добавление цвета ---
-    elif data == "add_color":
-        await query.message.reply_text("Введите название нового цвета:")
-
-    # --- Подтверждение сброса артикула ---
-    elif data == "reset_article_confirm":
-        keyboard = [
-            [InlineKeyboardButton("Да", callback_data="reset_article")],
-            [InlineKeyboardButton("Нет", callback_data="cancel")]
-        ]
-        await query.message.reply_text(f"Вы уверены, что хотите обнулить артикул {current_article}?", reply_markup=InlineKeyboardMarkup(keyboard))
-    elif data == "reset_article":
-        if current_article in inventory:
-            for color in inventory[current_article]:
-                inventory[current_article][color] = 0
-            await query.message.reply_text(f"Артикул {current_article} сброшен.")
-            await show_colors(query)
-
-    # --- Подтверждение Рестарт всего ---
-    elif data == "restart_confirm":
-        keyboard = [
-            [InlineKeyboardButton("Да", callback_data="restart")],
-            [InlineKeyboardButton("Нет", callback_data="cancel")]
-        ]
-        await query.message.reply_text("Вы уверены, что хотите полностью сбросить все данные?", reply_markup=InlineKeyboardMarkup(keyboard))
-    elif data == "restart":
-        inventory.clear()
-        current_article = None
-        await query.message.reply_text("Сессия сброшена. Начинаем с чистого листа.")
-        await main_menu(query)
-
-    # --- Отмена действия ---
-    elif data == "cancel":
-        await query.message.reply_text("Действие отменено.")
-        if current_article:
-            await show_colors(query)
+        # Если ввели текст - это цвет для текущего артикула
+        art = current_article.get(user_id)
+        if art:
+            if text not in inventory[art]:
+                inventory[art][text] = 6
+                save_data()
+            await show_colors(update, context)
         else:
-            await main_menu(query)
+            await update.message.reply_text("❌ Сначала введите номер артикула.")
 
-    # --- Итог / PDF ---
-    elif data == "pdf":
-        pdf = FPDF()
-        pdf.add_page()
-        pdf.set_font("Arial", size=12)
-        pdf.cell(200, 10, txt="Отчёт по складу", ln=True, align='C')
-        pdf.ln(5)
-        for article, colors in inventory.items():
-            pdf.cell(200, 10, txt=f"Артикул {article}:", ln=True)
-            for color, qty in colors.items():
-                pdf.cell(200, 10, txt=f"  {color}: {qty} пар", ln=True)
-            pdf.ln(3)
+async def show_colors(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    art = current_article.get(user_id)
+    if not art: return
+
+    text_lines = [f"📦 **Артикул: {art}**", "---", "Введите название цвета или жмите кнопки:"]
+    keyboard = []
+    
+    for idx, (color, count) in enumerate(inventory[art].items()):
+        text_lines.append(f"🔹 {color}: `{count}` пар")
+        keyboard.append([
+            InlineKeyboardButton(f"{color} +6", callback_data=f"a_{idx}"),
+            InlineKeyboardButton(f"🗑 {color}", callback_data=f"delcolor_{idx}")
+        ])
+    
+    keyboard.append([InlineKeyboardButton("❌ Удалить весь артикул", callback_data="delete_article")])
+    keyboard.append([InlineKeyboardButton("⬅️ В меню", callback_data="back_menu")])
+    
+    msg_text = "\n".join(text_lines)
+    if update.message:
+        await update.message.reply_text(msg_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    else:
+        await update.callback_query.edit_message_text(msg_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global inventory
+    query = update.callback_query
+    user_id = update.effective_user.id
+    art = current_article.get(user_id)
+    await query.answer()
+    
+    if query.data.startswith("a_") and art:
+        idx = int(query.data.split("_")[1])
+        colors = list(inventory[art].keys())
+        if idx < len(colors):
+            inventory[art][colors[idx]] += 6
+            save_data()
+            await show_colors(update, context)
+
+    elif query.data == "report":
+        if not inventory:
+            await query.edit_message_text("📭 Склад пуст.")
+            return
         
-        pdf_buffer = BytesIO()
-        pdf.output(pdf_buffer)
-        pdf_buffer.seek(0)
-        await query.message.reply_document(document=pdf_buffer, filename="inventory_report.pdf")
+        report = ["📋 **ПОЛНАЯ СВОДКА ПО СКЛАДУ**\n"]
+        total = 0
+        for art_name, colors in inventory.items():
+            if colors:
+                report.append(f"🆔 *Артикул {art_name}*:")
+                for c, q in colors.items():
+                    report.append(f"  - {c}: {q} пар")
+                    total += q
+                report.append("")
+        
+        report.append(f"📈 **Итого на складе: {total} пар**")
+        await query.message.reply_text("\n".join(report), parse_mode="Markdown")
+        await main_menu(update)
 
-    # --- Назад к меню ---
-    elif data == "back":
-        current_article = None
-        await main_menu(query)
+    elif query.data == "restart_confirm":
+        keyboard = [[InlineKeyboardButton("✅ Да, обнулить", callback_data="restart_yes")],
+                    [InlineKeyboardButton("❌ Отмена", callback_data="back_menu")]]
+        await query.edit_message_text("⚠️ **ВНИМАНИЕ!** Это удалит ВСЕ данные со склада. Вы уверены?", 
+                                      reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
-# --- Команда для массового добавления артикулов и цветов ---
-async def massadd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    lines = text.split("\n")
-    count = 0
-    for line in lines:
-        if ":" in line:
-            art, colors_str = line.split(":", 1)
-            art = art.strip()
-            colors = [c.strip() for c in colors_str.split(",") if c.strip()]
-            if art not in inventory:
-                inventory[art] = {}
-            for color in colors:
-                if color not in inventory[art]:
-                    inventory[art][color] = 0
-            count += 1
-    await update.message.reply_text(f"Добавлено/обновлено {count} артикулов с цветами.")
+    elif query.data == "restart_yes":
+        inventory = {}
+        save_data()
+        await query.edit_message_text("✅ Все данные успешно удалены.")
+        await main_menu(update)
+    
+    elif query.data == "back_menu":
+        await main_menu(update)
 
-# --- Запуск бота ---
-BOT_TOKEN = os.environ.get("BOT_TOKEN")  # токен из переменной окружения
-app = ApplicationBuilder().token(BOT_TOKEN).build()
-app.add_handler(CommandHandler("start", start))
-app.add_handler(CommandHandler("massadd", massadd))
-app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
-app.add_handler(CallbackQueryHandler(button_handler))
-app.run_polling()
+if __name__ == "__main__":
+    TOKEN = os.getenv("BOT_TOKEN")
+    if not TOKEN:
+        print("Ошибка: Переменная BOT_TOKEN не установлена!")
+        exit(1)
+    
+    app = ApplicationBuilder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
+    app.add_handler(CallbackQueryHandler(button_handler))
+    app.run_polling()
+    
