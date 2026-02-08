@@ -4,8 +4,10 @@ import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 
+# Настройка логов
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
 
+# Путь к данным
 DATA_DIR = "/app/data" if os.path.exists("/app/data") else "."
 DATA_FILE = os.path.join(DATA_DIR, "inventory.json")
 
@@ -26,7 +28,7 @@ def save_data():
 inventory = load_data()
 current_article = {}
 last_msg_id = {}
-edit_mode = {} # Для отслеживания, какой цвет сейчас редактируем вручную
+edit_mode = {}
 
 async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -50,6 +52,11 @@ async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sent = await context.bot.send_message(update.effective_chat.id, text, reply_markup=markup, parse_mode="Markdown")
         last_msg_id[user_id] = sent.message_id
 
+# --- ВОТ ЭТОЙ ФУНКЦИИ НЕ ХВАТАЛО ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await main_menu(update, context)
+# -----------------------------------
+
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text.strip()
@@ -57,29 +64,25 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try: await update.message.delete()
     except: pass
 
-    # 1. Если ввели число (ручной ввод количества)
     if text.isdigit() and user_id in edit_mode:
         art, color = edit_mode[user_id]
         if art in inventory and color in inventory[art]:
             inventory[art][color] = int(text)
             save_data()
-            del edit_mode[user_id] # Выходим из режима редактирования
+            del edit_mode[user_id]
             await show_colors(update, context)
             return
 
-    # 2. Если ввели артикул (содержит цифры, но не только они, или просто новый артикул)
-    if any(char.isdigit() for char in text) and len(text) > 3: # Пример: 715-44
+    if any(char.isdigit() for char in text) and len(text) >= 3:
         current_article[user_id] = text
         if text not in inventory:
             inventory[text] = {}
         await show_colors(update, context)
-    
-    # 3. Если ввели текст (название цвета)
     else:
         art = current_article.get(user_id)
         if art:
             if text not in inventory[art]:
-                inventory[art][text] = 0 # Создаем с нулем
+                inventory[art][text] = 0
                 save_data()
             await show_colors(update, context)
 
@@ -92,7 +95,8 @@ async def show_colors(update: Update, context: ContextTypes.DEFAULT_TYPE, custom
     if custom_text: text_lines.append(f"💡 {custom_text}\n---")
 
     keyboard = []
-    for idx, (color, count) in enumerate(inventory.get(art, {}).items()):
+    items = inventory.get(art, {})
+    for idx, (color, count) in enumerate(items.items()):
         status = "⚠️" if count <= 6 else "🔹"
         text_lines.append(f"{status} {color}: `{count}` пар")
         keyboard.append([
@@ -108,7 +112,8 @@ async def show_colors(update: Update, context: ContextTypes.DEFAULT_TYPE, custom
     markup = InlineKeyboardMarkup(keyboard)
 
     try:
-        await context.bot.edit_message_text(msg_text, update.effective_chat.id, last_msg_id[user_id], reply_markup=markup, parse_mode="Markdown")
+        m_id = last_msg_id.get(user_id)
+        await context.bot.edit_message_text(msg_text, update.effective_chat.id, m_id, reply_markup=markup, parse_mode="Markdown")
     except:
         sent = await context.bot.send_message(update.effective_chat.id, msg_text, reply_markup=markup, parse_mode="Markdown")
         last_msg_id[user_id] = sent.message_id
@@ -137,12 +142,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "need_order":
         order = [f"• `{a}`-{c}: **{q}**" for a, colors in inventory.items() for c, q in colors.items() if q <= 6]
-        await query.message.reply_text("🛒 **ДОЗАКАЗ:**\n" + "\n".join(order) if order else "✅ Ок")
+        await query.message.reply_text("🛒 **ДОЗАКАЗ:**\n" + ("\n".join(order) if order else "✅ Все в норме"))
         await main_menu(update, context)
 
     elif data == "report":
         rep = [f"🆔 *{a}*:\n" + "\n".join([f"  - {c}: {q}" for c, q in colors.items()]) for a, colors in inventory.items() if colors]
-        await query.message.reply_text("📋 **СВОДКА:**\n\n" + "\n".join(rep) if rep else "Пусто")
+        await query.message.reply_text("📋 **СВОДКА:**\n\n" + ("\n".join(rep) if rep else "Пусто"))
         await main_menu(update, context)
 
     elif data == "delete_article" and art:
@@ -159,11 +164,23 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data in ["back_menu", "start_bot"]:
         await main_menu(update, context)
 
+    elif data == "restart_confirm":
+        await query.edit_message_text("⚠️ Очистить всё?", reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Да", callback_data="restart_yes"), InlineKeyboardButton("❌ Нет", callback_data="back_menu")]
+        ]))
+
+    elif data == "restart_yes":
+        inventory.clear()
+        save_data()
+        await main_menu(update, context)
+
 if __name__ == "__main__":
     TOKEN = os.getenv("BOT_TOKEN")
+    if not TOKEN:
+        exit(1)
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.run_polling()
-    
+        
